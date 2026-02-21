@@ -60,6 +60,8 @@ down_since:    dict[str, datetime] = {}
 alerted:       set[str]           = set()
 # Contador de checks OK consecutivos por web
 ok_streak:     dict[str, int]     = {}
+# Lock para evitar que /check y el loop corran Playwright a la vez
+check_lock = asyncio.Lock()
 # ─────────────────────────────────────────────
 
 
@@ -231,7 +233,8 @@ def build_full_report(results: list) -> str:
 async def monitor_loop(bot: Bot):
     while True:
         logger.info("🔍 Comprobación automática...")
-        results = await run_checks()
+        async with check_lock:
+            results = await run_checks()
         now     = now_tz()
 
         for r in results:
@@ -297,8 +300,11 @@ async def cmd_start(update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def cmd_check(update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("🔍 Comprobando todas las webs, espera un momento...")
-    results = await run_checks()
+    if check_lock.locked():
+        await update.message.reply_text("⏳ Hay una comprobación en curso, espera un momento...")
+    async with check_lock:
+        await update.message.reply_text("🔍 Comprobando todas las webs, espera un momento...")
+        results = await run_checks()
     now = now_tz()
     for r in results:
         if r["status"] != "ok" and r["url"] not in down_since:
