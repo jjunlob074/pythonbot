@@ -6,18 +6,17 @@ Requisitos:
     playwright install chromium
 
 Uso:
-    1. Crea un bot en Telegram con @BotFather y obtén el TOKEN
-    2. Obtén tu CHAT_ID iniciando conversación con @userinfobot
-    3. Define las variables de entorno BOT_TOKEN y CHAT_ID:
-           export BOT_TOKEN="tu_token_aqui"
-           export CHAT_ID="tu_chat_id_aqui"
-    4. Ejecuta: python web_monitor_bot.py
+    1. Define las variables de entorno BOT_TOKEN y CHAT_ID
+    2. Ejecuta: python web_monitor_bot.py
 """
 
 import asyncio
 import logging
 import os
 from datetime import datetime
+from http.server import BaseHTTPRequestHandler, HTTPServer
+from threading import Thread
+
 from telegram import Bot
 from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes
 from playwright.async_api import async_playwright
@@ -28,6 +27,7 @@ from playwright.async_api import async_playwright
 BOT_TOKEN = os.environ["BOT_TOKEN"]
 CHAT_ID   = os.environ["CHAT_ID"]
 INTERVAL  = 5 * 60  # Intervalo en segundos (5 minutos)
+PORT      = int(os.environ.get("PORT", 10000))
 
 WEBSITES = [
     "https://www.redeia.com/es",
@@ -42,7 +42,7 @@ WEBSITES = [
     "https://www.sistemaelectrico-ree.es/es",
 ]
 
-TIMEOUT = 15_000  # ms (Playwright usa milisegundos)
+TIMEOUT = 15_000  # ms
 # ─────────────────────────────────────────────
 
 logging.basicConfig(
@@ -59,11 +59,32 @@ STATUS_EMOJIS = {
 }
 
 
+# ─────────────────────────────────────────────
+#  SERVIDOR HTTP (necesario para Render)
+# ─────────────────────────────────────────────
+
+class HealthHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.end_headers()
+        self.wfile.write(b"OK")
+
+    def log_message(self, format, *args):
+        pass  # Silencia los logs del servidor HTTP
+
+
+def start_http_server():
+    server = HTTPServer(("0.0.0.0", PORT), HealthHandler)
+    logger.info("🌐 Servidor HTTP escuchando en puerto %d", PORT)
+    server.serve_forever()
+
+
+# ─────────────────────────────────────────────
+#  COMPROBACIÓN DE WEBS (secuencial)
+# ─────────────────────────────────────────────
+
 async def check_website(url: str, browser) -> dict:
-    """
-    Comprueba una URL usando Playwright (Chromium headless).
-    Esto evita el bloqueo por JA3 fingerprinting de Incapsula/Imperva.
-    """
+    """Comprueba una URL. Abre un contexto, lo usa y lo cierra."""
     context = None
     try:
         context = await browser.new_context(
@@ -72,9 +93,7 @@ async def check_website(url: str, browser) -> dict:
                 "(KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36"
             ),
             locale="es-ES",
-            extra_http_headers={
-                "Accept-Language": "es-ES,es;q=0.9,en;q=0.8",
-            },
+            extra_http_headers={"Accept-Language": "es-ES,es;q=0.9,en;q=0.8"},
         )
         page = await context.new_page()
 
@@ -85,25 +104,16 @@ async def check_website(url: str, browser) -> dict:
         code = response.status if response else None
 
         if code is None:
-            status = "error"
-            description = "Sin respuesta"
+            status, description = "error", "Sin respuesta"
         elif 200 <= code < 300:
-            status = "ok"
-            description = get_http_description(code)
+            status, description = "ok", get_http_description(code)
         elif 300 <= code < 400:
-            status = "warning"
-            description = get_http_description(code)
+            status, description = "warning", get_http_description(code)
         else:
-            status = "error"
-            description = get_http_description(code)
+            status, description = "error", get_http_description(code)
 
-        return {
-            "url": url,
-            "status": status,
-            "code": code,
-            "time_ms": round(elapsed * 1000),
-            "description": description,
-        }
+        return {"url": url, "status": status, "code": code,
+                "time_ms": round(elapsed * 1000), "description": description}
 
     except Exception as e:
         err = str(e)
@@ -128,6 +138,26 @@ def get_http_description(code: int) -> str:
     }
     return descriptions.get(code, f"Código HTTP {code}")
 
+
+async def run_checks() -> list:
+    """
+    Comprobaciones SECUENCIALES con un único navegador.
+    Una web a la vez → mínimo consumo de RAM.
+    """
+    results = []
+    async with async_playwright() as p:
+        browser = await p.chromium.launch(headless=True)
+        for url in WEBSITES:
+            logger.info("  → Comprobando %s", url)
+            result = await check_website(url, browser)
+            results.append(result)
+        await browser.close()
+    return results
+
+
+# ─────────────────────────────────────────────
+#  INFORME
+# ─────────────────────────────────────────────
 
 def build_report(results: list) -> str:
     now    = datetime.now().strftime("%d/%m/%Y %H:%M:%S")
@@ -155,16 +185,6 @@ def build_report(results: list) -> str:
     return "\n".join(lines)
 
 
-async def run_checks() -> list:
-    """Lanza todas las comprobaciones en paralelo con un único navegador."""
-    async with async_playwright() as p:
-        browser = await p.chromium.launch(headless=True)
-        tasks = [check_website(url, browser) for url in WEBSITES]
-        results = await asyncio.gather(*tasks)
-        await browser.close()
-    return list(results)
-
-
 # ─────────────────────────────────────────────
 #  LOOP DE MONITORIZACIÓN
 # ─────────────────────────────────────────────
@@ -172,7 +192,7 @@ async def run_checks() -> list:
 async def monitor_loop(bot: Bot):
     """Bucle infinito que comprueba las webs cada INTERVAL segundos."""
     while True:
-        logger.info("🔍 Comprobando webs con Playwright...")
+        logger.info("🔍 Iniciando comprobación secuencial de webs...")
         results = await run_checks()
         message = build_report(results)
         await bot.send_message(chat_id=CHAT_ID, text=message, parse_mode="Markdown")
@@ -197,7 +217,7 @@ async def cmd_start(update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def cmd_check(update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("🔍 Comprobando webs con Playwright, espera un momento...")
+    await update.message.reply_text("🔍 Comprobando webs, espera un momento...")
     results = await run_checks()
     await update.message.reply_text(build_report(results), parse_mode="Markdown")
 
@@ -219,6 +239,9 @@ async def post_init(app):
 
 
 def main():
+    # Arranca el servidor HTTP en un hilo separado (requerido por Render)
+    Thread(target=start_http_server, daemon=True).start()
+
     app = (
         ApplicationBuilder()
         .token(BOT_TOKEN)
