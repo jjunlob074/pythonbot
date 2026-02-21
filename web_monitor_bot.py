@@ -14,6 +14,7 @@ import asyncio
 import logging
 import os
 from datetime import datetime
+from zoneinfo import ZoneInfo
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from threading import Thread
 
@@ -26,7 +27,7 @@ from playwright.async_api import async_playwright
 # ─────────────────────────────────────────────
 BOT_TOKEN = os.environ["BOT_TOKEN"]
 CHAT_ID   = os.environ["CHAT_ID"]
-INTERVAL  = 5 * 60  # Intervalo en segundos (5 minutos)
+INTERVAL  = 3 * 60  # Intervalo en segundos (3 minutos)
 PORT      = int(os.environ.get("PORT", 10000))
 
 WEBSITES = [
@@ -42,7 +43,7 @@ WEBSITES = [
     "https://www.sistemaelectrico-ree.es/es",
 ]
 
-TIMEOUT = 15_000  # ms
+TIMEOUT = 60_000  # ms
 # ─────────────────────────────────────────────
 
 logging.basicConfig(
@@ -160,7 +161,8 @@ async def run_checks() -> list:
 # ─────────────────────────────────────────────
 
 def build_report(results: list) -> str:
-    now    = datetime.now().strftime("%d/%m/%Y %H:%M:%S")
+    TZ = ZoneInfo("Europe/Madrid")
+    now    = datetime.now(TZ).strftime("%d/%m/%Y %H:%M:%S")
     ok     = sum(1 for r in results if r["status"] == "ok")
     failed = len(results) - ok
 
